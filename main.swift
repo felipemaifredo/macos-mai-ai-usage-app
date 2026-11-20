@@ -20,6 +20,7 @@ enum FetchError: Error {
 }
 
 protocol UsageProvider {
+    var name: String { get }
     var symbol: String { get }
     var expiredMessage: String { get }
     func fetch() async throws -> [UsageRow]
@@ -41,12 +42,18 @@ func parseDate(_ s: String?) -> Date? {
     return isoFrac.date(from: s) ?? isoPlain.date(from: s)
 }
 
-func formatReset(_ d: Date?) -> String {
+/// "14:30" today, "sex. 14:30" on other days.
+func shortReset(_ d: Date?) -> String {
     guard let d else { return "" }
     let f = DateFormatter()
     f.locale = Locale(identifier: "pt_BR")
     f.dateFormat = Calendar.current.isDateInToday(d) ? "HH:mm" : "EEE HH:mm"
-    return " · reseta \(f.string(from: d))"
+    return f.string(from: d)
+}
+
+func formatReset(_ d: Date?) -> String {
+    guard let d else { return "" }
+    return " · reseta \(shortReset(d))"
 }
 
 func performJSON(_ req: URLRequest) async throws -> [String: Any] {
@@ -69,6 +76,7 @@ func performJSON(_ req: URLRequest) async throws -> [String: Any] {
 // MARK: - Claude
 
 struct ClaudeProvider: UsageProvider {
+    let name = "Claude"
     let symbol = "◐"
     let expiredMessage = "Login expirado: abra o Claude Code para renovar"
 
@@ -133,6 +141,7 @@ struct ClaudeProvider: UsageProvider {
 // MARK: - Antigravity (local hub API)
 
 struct AntigravityProvider: UsageProvider {
+    let name = "Antigravity"
     let symbol = "✦"
     let expiredMessage = "Antigravity recusou o acesso: reabra o Antigravity"
 
@@ -224,6 +233,10 @@ final class ProviderController: NSObject {
     var errorText: String?
     var isLoading = false
     var onToggleLogin: () -> Void = {}
+    /// Called after every fetch, successful or not.
+    var onUpdate: () -> Void = {}
+    /// Status line of the USB display, shown in the menu.
+    var deviceStatus: () -> String? = { nil }
 
     // A button inside a custom-view menu item, so clicking it does not close the menu.
     lazy var refreshButton: NSButton = {
@@ -287,6 +300,7 @@ final class ProviderController: NSObject {
             self.isLoading = false
             self.updateTitle()
             self.rebuildMenu()
+            self.onUpdate()
         }
     }
 
@@ -350,6 +364,9 @@ final class ProviderController: NSObject {
             top.append(item)
         }
         top.append(.separator())
+        if let device = deviceStatus() {
+            top.append(disabled(device))
+        }
         if let lastUpdate {
             let f = DateFormatter(); f.dateFormat = "HH:mm:ss"
             top.append(disabled("Última atualização: \(f.string(from: lastUpdate))"))
@@ -383,11 +400,207 @@ final class ProviderController: NSObject {
     }
 }
 
+// MARK: - USB display (ESP32-S3 over serial)
+
+/// Talks to the touch display over USB serial using one JSON object per line.
+/// Board → Mac: {"t":"hello"} (repeated until it hears from us), {"t":"press","id":"refresh" or "key:<deck key>"}
+/// Mac → Board: {"t":"usage",…} on every refresh and on hello, {"t":"ping"} every 2 s.
+/// Every candidate port is probed; a port that never says hello is skipped until it disappears.
+@MainActor
+final class SerialLink {
+    static let prefixes = ["cu.usbmodem", "cu.usbserial", "cu.wchusbserial"]
+
+    var snapshot: () -> [String: Any] = { [:] }
+    var onPress: (String) -> Void = { _ in }
+    var onStatusChange: () -> Void = {}
+    private(set) var isLinked = false
+
+    private var fd: Int32 = -1
+    private var path: String?
+    private var openedAt = Date()
+    private var source: DispatchSourceRead?
+    private var buffer = Data()
+    private var ignored: Set<String> = []
+    private var timer: Timer?
+
+    func start() {
+        let t = Timer(timeInterval: 2, repeats: true) { _ in
+            Task { @MainActor in self.tick() }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+        tick()
+    }
+
+    func candidates() -> [String] {
+        var names = ((try? FileManager.default.contentsOfDirectory(atPath: "/dev")) ?? [])
+            .filter { n in Self.prefixes.contains { n.hasPrefix($0) } }
+            .sorted()
+            .map { "/dev/\($0)" }
+        // For testing without the board (e.g. a pty): AI_USAGE_SERIAL=/dev/ttys012
+        if let extra = ProcessInfo.processInfo.environment["AI_USAGE_SERIAL"] { names.insert(extra, at: 0) }
+        return names
+    }
+
+    func tick() {
+        let present = Set(candidates())
+        ignored.formIntersection(present)
+        if fd >= 0 {
+            if isLinked {
+                send(["t": "ping"])
+            } else if Date().timeIntervalSince(openedAt) > 6, let path {
+                ignored.insert(path) // not our board
+                close()
+            }
+            return
+        }
+        for p in candidates() where !ignored.contains(p) {
+            if open(p) { return }
+            ignored.insert(p)
+        }
+    }
+
+    private func open(_ p: String) -> Bool {
+        let f = Darwin.open(p, O_RDWR | O_NOCTTY | O_NONBLOCK)
+        guard f >= 0 else { return false }
+        var t = termios()
+        if tcgetattr(f, &t) == 0 {
+            cfmakeraw(&t)
+            cfsetspeed(&t, speed_t(B115200))
+            t.c_cflag |= tcflag_t(CLOCAL | CREAD)
+            tcsetattr(f, TCSANOW, &t)
+        }
+        fd = f
+        path = p
+        openedAt = Date()
+        buffer.removeAll()
+        let src = DispatchSource.makeReadSource(fileDescriptor: f, queue: .main)
+        src.setEventHandler { [weak self] in
+            MainActor.assumeIsolated { self?.readAvailable() }
+        }
+        src.setCancelHandler { Darwin.close(f) }
+        src.resume()
+        source = src
+        return true
+    }
+
+    private func close() {
+        source?.cancel() // closes the fd
+        source = nil
+        fd = -1
+        path = nil
+        buffer.removeAll()
+        if isLinked {
+            isLinked = false
+            onStatusChange()
+        }
+    }
+
+    private func readAvailable() {
+        var chunk = [UInt8](repeating: 0, count: 4096)
+        let n = read(fd, &chunk, chunk.count)
+        if n > 0 {
+            buffer.append(contentsOf: chunk[0..<n])
+            if buffer.count > 64 * 1024 { buffer.removeAll() } // garbage, not our protocol
+            while let nl = buffer.firstIndex(of: 0x0A) {
+                let line = buffer[buffer.startIndex..<nl]
+                buffer.removeSubrange(buffer.startIndex...nl)
+                handle(Data(line))
+            }
+        } else if n == 0 || (errno != EAGAIN && errno != EINTR) {
+            close() // unplugged
+        }
+    }
+
+    private func handle(_ line: Data) {
+        guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+              let type = obj["t"] as? String else { return } // boot logs and other noise
+        switch type {
+        case "hello":
+            if !isLinked {
+                isLinked = true
+                onStatusChange()
+            }
+            send(snapshot())
+        case "press":
+            if isLinked, let id = obj["id"] as? String { onPress(id) }
+        default:
+            break
+        }
+    }
+
+    func send(_ obj: [String: Any]) {
+        guard fd >= 0, var data = try? JSONSerialization.data(withJSONObject: obj) else { return }
+        data.append(0x0A)
+        data.withUnsafeBytes { raw in
+            var off = 0
+            var tries = 0
+            while off < raw.count && tries < 50 {
+                let w = write(fd, raw.baseAddress! + off, raw.count - off)
+                if w > 0 { off += w } else if errno == EAGAIN { tries += 1; usleep(2000) } else { return }
+            }
+        }
+    }
+
+    /// The board's fonts are ASCII only.
+    static func ascii(_ s: String) -> String {
+        let stripped = s.applyingTransform(.stripDiacritics, reverse: false) ?? s
+        return String(stripped.unicodeScalars.map { $0.isASCII ? Character($0) : "?" })
+    }
+}
+
+// MARK: - Deck actions (the "Atalhos" page on the display)
+
+@MainActor
+enum DeckActions {
+    // NX_KEYTYPE_* from IOKit/hidsystem/ev_keymap.h
+    static let mediaKeys: [String: Int] = [
+        "volup": 0, "voldown": 1, "mute": 7, "play": 16, "next": 17, "prev": 18,
+    ]
+
+    static func run(_ id: String) {
+        if let key = mediaKeys[id] {
+            postMediaKey(key)
+            return
+        }
+        switch id {
+        case "shot":
+            // The same toolbar as ⌘⇧5.
+            let url = URL(fileURLWithPath: "/System/Applications/Utilities/Screenshot.app")
+            NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+        case "sleep":
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
+            p.arguments = ["displaysleepnow"]
+            try? p.run()
+        default:
+            break
+        }
+    }
+
+    /// Posting keyboard events needs Accessibility permission; the first press asks for it.
+    /// The app is signed ad-hoc, so every rebuild needs it granted again.
+    static func postMediaKey(_ key: Int) {
+        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        guard AXIsProcessTrustedWithOptions(opts) else { return }
+        for down in [true, false] {
+            let state = down ? 0xA : 0xB
+            let ev = NSEvent.otherEvent(
+                with: .systemDefined, location: .zero,
+                modifierFlags: NSEvent.ModifierFlags(rawValue: UInt(state << 8)),
+                timestamp: 0, windowNumber: 0, context: nil,
+                subtype: 8, data1: (key << 16) | (state << 8), data2: -1)
+            ev?.cgEvent?.post(tap: .cghidEventTap)
+        }
+    }
+}
+
 // MARK: - App
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var controllers: [ProviderController] = []
+    let device = SerialLink()
 
     func applicationDidFinishLaunching(_ n: Notification) {
         // Status items created later appear further left: Antigravity first so Claude sits left of it.
@@ -397,8 +610,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ]
         for c in controllers {
             c.onToggleLogin = { [weak self] in self?.controllers.forEach { $0.rebuildMenu() } }
+            c.onUpdate = { [weak self] in self?.pushToDevice() }
+            c.deviceStatus = { [weak self] in
+                self?.device.isLinked == true ? "Tela USB: conectada" : nil
+            }
             c.refresh()
         }
+
+        device.snapshot = { [weak self] in self?.deviceSnapshot() ?? [:] }
+        device.onPress = { [weak self] id in
+            if id == "refresh" { self?.controllers.forEach { $0.refresh() } }
+            else if id.hasPrefix("key:") { DeckActions.run(String(id.dropFirst(4))) }
+        }
+        device.onStatusChange = { [weak self] in self?.controllers.forEach { $0.rebuildMenu() } }
+        device.start()
+    }
+
+    func pushToDevice() {
+        if device.isLinked { device.send(deviceSnapshot()) }
+    }
+
+    func deviceSnapshot() -> [String: Any] {
+        let a = SerialLink.ascii
+        let f = DateFormatter(); f.dateFormat = "HH:mm"
+        // Claude first on the display, the same order as in the menu bar.
+        let providers: [[String: Any]] = controllers.reversed().map { c in
+            [
+                "name": a(c.provider.name),
+                "pct": c.provider.headline(c.rows).map { Int($0.rounded()) } ?? -1,
+                "err": a(c.errorText ?? ""),
+                "busy": c.isLoading,
+                "at": c.lastUpdate.map { f.string(from: $0) } ?? "",
+                "rows": c.rows.map { r in [
+                    "sec": a(r.section ?? ""),
+                    "label": a(r.label),
+                    "pct": Int(r.usedPct.rounded()),
+                    "reset": a(shortReset(r.resetsAt)),
+                ] as [String: Any] },
+            ]
+        }
+        return ["t": "usage", "providers": providers]
     }
 }
 

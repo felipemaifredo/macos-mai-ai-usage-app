@@ -31,10 +31,9 @@ Os tokens ficam só na memória. O app não os grava e não os envia para nenhum
 ## Estrutura
 
 ```
-main.swift          # app inteiro (provedores Claude e Antigravity, barra de menus, tela USB)
+main.swift          # app inteiro (provedores Claude e Antigravity, barra de menus)
 Info.plist          # bundle "AI Usage", LSUIElement (sem ícone no Dock)
 build.sh            # compila, empacota, assina ad-hoc e instala em /Applications
-firmware/           # firmware da tela USB (PlatformIO + LVGL)
 icon/
   make_icon.swift   # desenha o ícone (gera icon_1024.png)
   AppIcon.icns      # ícone usado pelo app
@@ -53,34 +52,14 @@ iconutil -c icns AppIcon.iconset -o AppIcon.icns && rm -rf AppIcon.iconset
 cd .. && bash build.sh
 ```
 
-## Tela USB (Waveshare ESP32-S3-Touch-LCD-7)
+## Compartilhar o uso com outros apps
 
-O app também envia o uso para uma tela touch de 7" ligada ao Mac por cabo USB. O firmware fica em `firmware/`.
+A cada atualização, o app publica os números numa notificação distribuída do macOS. É assim que o [Waveshare Link](../macos-mai-waveshare-link-app) mostra o uso na tela USB. O AI Usage não sabe nada da placa.
 
-### Gravar o firmware
+| Notificação | Quem envia | Conteúdo |
+|---|---|---|
+| `local.aiusagebar.usage` | AI Usage, a cada atualização | `userInfo["json"]` = `{"providers":[{"name","pct","err","busy","at","rows":[{"sec","label","pct","reset"}]}]}` |
+| `local.aiusagebar.request` | outro app | pede os números atuais. O AI Usage responde com `usage` |
+| `local.aiusagebar.refresh` | outro app | pede uma atualização agora |
 
-1. Instale a extensão **PlatformIO IDE** no VS Code.
-2. Abra a pasta `firmware/` no VS Code (*File → Open Folder*).
-3. Ligue a placa pela porta **UART** com um cabo USB-C **de dados**.
-4. Clique em *Upload* (→) na barra do PlatformIO, ou rode `pio run -t upload` na pasta `firmware/`.
-
-Pela linha de comando, sem o VS Code, o equivalente é `pio run -t upload`.
-
-### Uso
-
-Deixe a placa ligada no Mac, em qualquer uma das duas portas, com o app AI Usage aberto. O app encontra a placa sozinho em até 2 s e reconecta se o cabo sair. Quando a placa está ligada, o menu mostra "Tela USB: conectada". O botão **Atualizar** da tela atualiza os dois serviços.
-
-### Protocolo
-
-É um objeto JSON por linha, a 115200 baud:
-
-| Direção | Mensagem |
-|---|---|
-| Placa → Mac | `{"t":"hello"}` a cada 1 s até o Mac responder |
-| Placa → Mac | `{"t":"press","id":"refresh"}` quando alguém toca num botão |
-| Mac → Placa | `{"t":"usage","providers":[{"name","pct","err","busy","at","rows":[{"sec","label","pct","reset"}]}]}` |
-| Mac → Placa | `{"t":"ping"}` a cada 2 s. Se a placa ficar 8 s sem receber nada, volta a mostrar "Aguardando o Mac..." |
-
-O app testa as portas `/dev/cu.usbmodem*`, `cu.usbserial*` e `cu.wchusbserial*`. Uma porta que não responde `hello` em 6 s é ignorada até ser desconectada. Os textos chegam sem acentos porque as fontes da placa só têm ASCII.
-
-Para testar sem a placa, use `AI_USAGE_SERIAL=/dev/ttysNNN` para apontar o app para um pty.
+Só vão os números e os horários. Os tokens nunca saem do app.

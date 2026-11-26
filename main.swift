@@ -1,229 +1,12 @@
 import AppKit
 import ServiceManagement
 
-// MARK: - Model
-
-struct UsageRow {
-    let section: String?
-    let label: String
-    let usedPct: Double
-    let resetsAt: Date?
-}
-
-enum FetchError: Error {
-    case noCredentials
-    case expired
-    case notRunning
-    case http(Int)
-    case badResponse
-    case network(String)
-}
-
-protocol UsageProvider {
-    var name: String { get }
-    var symbol: String { get }
-    var expiredMessage: String { get }
-    func fetch() async throws -> [UsageRow]
-    /// Value shown in the menu bar title.
-    func headline(_ rows: [UsageRow]) -> Double?
-}
-
-// MARK: - Helpers
-
-let isoFrac: ISO8601DateFormatter = {
-    let f = ISO8601DateFormatter()
-    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    return f
-}()
-let isoPlain = ISO8601DateFormatter()
-
-func parseDate(_ s: String?) -> Date? {
-    guard let s else { return nil }
-    return isoFrac.date(from: s) ?? isoPlain.date(from: s)
-}
-
-/// "14:30" today, "sex. 14:30" on other days.
-func shortReset(_ d: Date?) -> String {
-    guard let d else { return "" }
-    let f = DateFormatter()
-    f.locale = Locale(identifier: "pt_BR")
-    f.dateFormat = Calendar.current.isDateInToday(d) ? "HH:mm" : "EEE HH:mm"
-    return f.string(from: d)
-}
-
-func formatReset(_ d: Date?) -> String {
-    guard let d else { return "" }
-    return " · reseta \(shortReset(d))"
-}
-
-func performJSON(_ req: URLRequest) async throws -> [String: Any] {
-    let data: Data
-    let resp: URLResponse
-    do {
-        (data, resp) = try await URLSession.shared.data(for: req)
-    } catch {
-        throw FetchError.network(error.localizedDescription)
-    }
-    guard let http = resp as? HTTPURLResponse else { throw FetchError.badResponse }
-    if http.statusCode == 401 || http.statusCode == 403 { throw FetchError.expired }
-    guard http.statusCode == 200 else { throw FetchError.http(http.statusCode) }
-    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-        throw FetchError.badResponse
-    }
-    return json
-}
-
-// MARK: - Claude
-
-struct ClaudeProvider: UsageProvider {
-    let name = "Claude"
-    let symbol = "◐"
-    let expiredMessage = "Login expirado: abra o Claude Code para renovar"
-
-    func readAccessToken() throws -> String {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        p.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
-        let out = Pipe()
-        p.standardOutput = out
-        p.standardError = Pipe()
-        try p.run()
-        let data = out.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        guard p.terminationStatus == 0,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let oauth = json["claudeAiOauth"] as? [String: Any],
-              let token = oauth["accessToken"] as? String
-        else { throw FetchError.noCredentials }
-        if let exp = oauth["expiresAt"] as? Double, exp / 1000 < Date().timeIntervalSince1970 {
-            throw FetchError.expired
-        }
-        return token
-    }
-
-    func label(for key: String) -> String {
-        switch key {
-        case "five_hour": return "Sessão (5h)"
-        case "seven_day": return "Semana"
-        case "seven_day_opus": return "Semana (Opus)"
-        case "seven_day_sonnet": return "Semana (Sonnet)"
-        default: return key.replacingOccurrences(of: "_", with: " ").capitalized
-        }
-    }
-
-    func fetch() async throws -> [UsageRow] {
-        let token = try readAccessToken()
-        var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
-        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.timeoutInterval = 20
-        let json = try await performJSON(req)
-
-        let order = ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"]
-        var items: [(key: String, util: Double, reset: Date?)] = []
-        for (key, value) in json {
-            guard let obj = value as? [String: Any],
-                  let util = (obj["utilization"] as? NSNumber)?.doubleValue else { continue }
-            items.append((key, util, parseDate(obj["resets_at"] as? String)))
-        }
-        items.sort {
-            (order.firstIndex(of: $0.key) ?? 99, $0.key) < (order.firstIndex(of: $1.key) ?? 99, $1.key)
-        }
-        return items.map { UsageRow(section: nil, label: label(for: $0.key), usedPct: $0.util, resetsAt: $0.reset) }
-    }
-
-    func headline(_ rows: [UsageRow]) -> Double? {
-        (rows.first { $0.label == "Sessão (5h)" } ?? rows.first)?.usedPct
-    }
-}
-
-// MARK: - Antigravity (local hub API)
-
-struct AntigravityProvider: UsageProvider {
-    let name = "Antigravity"
-    let symbol = "✦"
-    let expiredMessage = "Antigravity recusou o acesso: reabra o Antigravity"
-
-    struct Hub { let port: Int; let csrf: String }
-
-    func findHub() throws -> Hub {
-        let dir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".gemini/antigravity/daemon")
-        let files = (try? FileManager.default.contentsOfDirectory(
-            at: dir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
-        let candidates = files
-            .filter { $0.lastPathComponent.hasPrefix("hub_") && $0.pathExtension == "json" }
-            .sorted {
-                let a = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                let b = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                return a > b
-            }
-        for url in candidates {
-            guard let data = try? Data(contentsOf: url),
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let pid = (json["pid"] as? NSNumber)?.int32Value,
-                  let port = (json["httpPort"] as? NSNumber)?.intValue,
-                  let csrf = json["csrfToken"] as? String,
-                  kill(pid, 0) == 0
-            else { continue }
-            return Hub(port: port, csrf: csrf)
-        }
-        throw FetchError.notRunning
-    }
-
-    func windowLabel(_ w: String?) -> String {
-        switch w {
-        case "5h": return "Sessão (5h)"
-        case "weekly": return "Semana"
-        case let other?: return other
-        case nil: return "Limite"
-        }
-    }
-
-    func fetch() async throws -> [UsageRow] {
-        let hub = try findHub()
-        var req = URLRequest(url: URL(string:
-            "http://127.0.0.1:\(hub.port)/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary")!)
-        req.httpMethod = "POST"
-        req.httpBody = Data("{}".utf8)
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue("1", forHTTPHeaderField: "Connect-Protocol-Version")
-        req.setValue(hub.csrf, forHTTPHeaderField: "x-codeium-csrf-token")
-        req.timeoutInterval = 20
-
-        let json: [String: Any]
-        do {
-            json = try await performJSON(req)
-        } catch FetchError.network {
-            throw FetchError.notRunning
-        }
-        guard let resp = json["response"] as? [String: Any],
-              let groups = resp["groups"] as? [[String: Any]] else { throw FetchError.badResponse }
-
-        var rows: [UsageRow] = []
-        for g in groups {
-            let section = g["displayName"] as? String
-            for b in (g["buckets"] as? [[String: Any]]) ?? [] {
-                guard let remaining = (b["remainingFraction"] as? NSNumber)?.doubleValue else { continue }
-                rows.append(UsageRow(section: section,
-                                     label: windowLabel(b["window"] as? String),
-                                     usedPct: max(0, min(100, (1 - remaining) * 100)),
-                                     resetsAt: parseDate(b["resetTime"] as? String)))
-            }
-        }
-        return rows
-    }
-
-    func headline(_ rows: [UsageRow]) -> Double? {
-        rows.map(\.usedPct).max()
-    }
-}
+// Providers (Claude, Codex, Antigravity) live in UsageProviders.swift.
 
 // MARK: - One menu bar item per provider
 
 @MainActor
-final class ProviderController: NSObject {
+final class ProviderController: NSObject, NSMenuDelegate {
     let provider: UsageProvider
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let menu = NSMenu()
@@ -232,13 +15,20 @@ final class ProviderController: NSObject {
     var lastUpdate: Date?
     var errorText: String?
     var isLoading = false
+    /// After an HTTP 429, nothing is asked until this date.
+    var blockedUntil: Date?
+    /// When the API was last asked. The ↻ button waits `minManualGap` after it.
+    var askedAt: Date?
+    static let minManualGap: TimeInterval = 60
+    /// Re-enables the ↻ button while the menu is open, once the wait is over.
+    var unlockTimer: Timer?
     var onToggleLogin: () -> Void = {}
     /// Called after every fetch, successful or not.
     var onUpdate: () -> Void = {}
 
     // A button inside a custom-view menu item, so clicking it does not close the menu.
     lazy var refreshButton: NSButton = {
-        let b = NSButton(title: "↻ Atualizar agora", target: self, action: #selector(refresh))
+        let b = NSButton(title: "↻ Atualizar agora", target: self, action: #selector(refreshManually))
         b.bezelStyle = .rounded
         b.controlSize = .small
         b.sizeToFit()
@@ -257,6 +47,7 @@ final class ProviderController: NSObject {
         self.provider = provider
         super.init()
         menu.autoenablesItems = false
+        menu.delegate = self
         statusItem.menu = menu
         setTitle("\(provider.symbol) …", color: nil)
         rebuildMenu()
@@ -271,9 +62,34 @@ final class ProviderController: NSObject {
         timer = t
     }
 
-    @objc func refresh() {
+    func menuWillOpen(_ menu: NSMenu) { rebuildMenu() }
+
+    /// The ↻ button, or another app asking for fresh numbers.
+    @objc func refreshManually() { refresh(manual: true) }
+
+    /// Earliest moment the ↻ button may ask the API again.
+    var manualAllowedAt: Date? {
+        let gapEnd = askedAt?.addingTimeInterval(Self.minManualGap)
+        let later = [gapEnd, blockedUntil].compactMap { $0 }.max()
+        return later.flatMap { $0 > Date() ? $0 : nil }
+    }
+
+    func refresh(manual: Bool = false) {
         guard !isLoading else { return }
+        if let until = blockedUntil, Date() < until {
+            // The API said to wait. Local numbers (if the provider has them) are still fine to read.
+            if let rows = provider.fallbackRows() {
+                self.rows = rows
+                lastUpdate = Date()
+                updateTitle()
+                rebuildMenu()
+                onUpdate()
+            }
+            return
+        }
+        if manual, manualAllowedAt != nil { return }
         isLoading = true
+        askedAt = Date()
         scheduleTimer()
         rebuildMenu()
         Task {
@@ -281,13 +97,23 @@ final class ProviderController: NSObject {
                 self.rows = try await provider.fetch()
                 self.lastUpdate = Date()
                 self.errorText = nil
+                self.blockedUntil = nil
             } catch FetchError.notRunning {
                 self.rows = []
-                self.errorText = "Antigravity não está aberto"
+                self.errorText = provider.noCredentialsMessage
             } catch FetchError.expired {
                 self.errorText = provider.expiredMessage
             } catch FetchError.noCredentials {
-                self.errorText = "Credenciais do Claude Code não encontradas"
+                self.errorText = provider.noCredentialsMessage
+            } catch FetchError.rateLimited(let until) {
+                // Keep showing the last numbers, or local ones if the provider has them.
+                self.blockedUntil = until
+                if let rows = provider.fallbackRows() {
+                    self.rows = rows
+                    self.lastUpdate = Date()
+                }
+                let f = DateFormatter(); f.dateFormat = "HH:mm"
+                self.errorText = "Limite de consultas da API. Tento de novo às \(f.string(from: until))"
             } catch FetchError.http(let code) {
                 self.errorText = "Erro HTTP \(code)"
             } catch FetchError.network(let msg) {
@@ -370,8 +196,24 @@ final class ProviderController: NSObject {
         while menu.items.first !== refreshItem { menu.removeItem(at: 0) }
         for (i, item) in top.enumerated() { menu.insertItem(item, at: i) }
 
-        refreshButton.title = isLoading ? "Atualizando…" : "↻ Atualizar agora"
-        refreshButton.isEnabled = !isLoading
+        unlockTimer?.invalidate()
+        if isLoading {
+            refreshButton.title = "Atualizando…"
+            refreshButton.isEnabled = false
+        } else if let until = manualAllowedAt {
+            let f = DateFormatter(); f.dateFormat = "HH:mm:ss"
+            refreshButton.title = "Aguarde até \(f.string(from: until))"
+            refreshButton.isEnabled = false
+            let t = Timer(fire: until.addingTimeInterval(0.5), interval: 0, repeats: false) { [weak self] _ in
+                MainActor.assumeIsolated { self?.rebuildMenu() }
+            }
+            RunLoop.main.add(t, forMode: .common)
+            unlockTimer = t
+        } else {
+            refreshButton.title = "↻ Atualizar agora"
+            refreshButton.isEnabled = true
+        }
+        refreshButton.sizeToFit()
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
     }
 
@@ -402,9 +244,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var controllers: [ProviderController] = []
 
     func applicationDidFinishLaunching(_ n: Notification) {
-        // Status items created later appear further left: Antigravity first so Claude sits left of it.
+        // Status items created later appear further left: Antigravity first, so the bar reads
+        // Claude, Codex, Antigravity from left to right.
         controllers = [
             ProviderController(provider: AntigravityProvider()),
+            ProviderController(provider: CodexProvider()),
             ProviderController(provider: ClaudeProvider()),
         ]
         for c in controllers {
@@ -418,7 +262,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             MainActor.assumeIsolated { self?.broadcast() }
         }
         center.addObserver(forName: Self.refreshName, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.controllers.forEach { $0.refresh() } }
+            MainActor.assumeIsolated { self?.controllers.forEach { $0.refresh(manual: true) } }
         }
     }
 
@@ -439,7 +283,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func usageSnapshot() -> [[String: Any]] {
         let f = DateFormatter(); f.dateFormat = "HH:mm"
-        // Claude first, the same order as in the menu bar.
+        // Claude, Codex, Antigravity: the same order as in the menu bar.
         return controllers.reversed().map { c in
             [
                 "name": c.provider.name,

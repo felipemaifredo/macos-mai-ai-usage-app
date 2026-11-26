@@ -3,11 +3,12 @@
 App de barra de menus do macOS que mostra o uso dos planos de IA:
 
 - **◐ Claude**: % da sessão de 5h. O menu mostra Sessão (5h), Semana e, se houver, Opus e Sonnet, cada um com o horário em que reseta.
+- **◎ Codex**: % da sessão de 5h. O menu mostra Sessão (5h) e Semana, cada um com o horário em que reseta.
 - **✦ Antigravity (Gemini)**: % do limite mais perto de acabar. O menu mostra cada grupo de modelos com Sessão (5h) e Semana.
 
 Atualiza automaticamente a cada 5 min. O botão "↻ Atualizar agora" atualiza sem fechar o menu.
 
-App nativo em Swift/AppKit, em um arquivo só. Não usa Xcode nem Electron.
+App nativo em Swift/AppKit. Não usa Xcode nem Electron.
 
 ## Build
 
@@ -15,13 +16,14 @@ App nativo em Swift/AppKit, em um arquivo só. Não usa Xcode nem Electron.
 bash build.sh
 ```
 
-O script compila `main.swift`, monta `build/AI Usage.app` e instala o app em `/Applications`. Depois do build, feche o app (Sair) e abra de novo.
+O script compila `UsageProviders.swift` e `main.swift`, monta `build/AI Usage.app` e instala o app em `/Applications`. Depois do build, feche o app (Sair) e abra de novo.
 
 ## De onde vêm os dados
 
 | Serviço | Fonte | Autenticação |
 |---|---|---|
 | Claude | `GET https://api.anthropic.com/api/oauth/usage` (header `anthropic-beta: oauth-2025-04-20`) | Token OAuth do Claude Code, lido do Keychain (`Claude Code-credentials`) via `/usr/bin/security` |
+| Codex | `GET https://chatgpt.com/backend-api/wham/usage` (a mesma do `/status` do Codex). Se a resposta não for entendida, usa o último `rate_limits` gravado em `~/.codex/sessions` | Login do Codex, lido de `~/.codex/auth.json` (ou `$CODEX_HOME`) |
 | Antigravity | `POST http://127.0.0.1:<httpPort>/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary` | `csrfToken` e porta lidos de `~/.gemini/antigravity/daemon/hub_*.json`, usando só o arquivo cujo `pid` está vivo |
 
 As duas APIs são **internas e não documentadas** e podem mudar sem aviso. Os dados do Antigravity só aparecem com ele aberto.
@@ -31,7 +33,8 @@ Os tokens ficam só na memória. O app não os grava e não os envia para nenhum
 ## Estrutura
 
 ```
-main.swift          # app inteiro (provedores Claude e Antigravity, barra de menus)
+main.swift          # barra de menus
+UsageProviders.swift # provedores Claude, Codex e Antigravity (igual ao do Waveshare Link: mantenha os dois iguais)
 Info.plist          # bundle "AI Usage", LSUIElement (sem ícone no Dock)
 build.sh            # compila, empacota, assina ad-hoc e instala em /Applications
 icon/
